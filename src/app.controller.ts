@@ -22,7 +22,7 @@ export class AppController {
   @Redirect()
   async redirectByCodeAndType(@Param('code') code: string, @Param('type') type: string) {
     const normalizedType = type.toLowerCase() as SupportedType;
-    const fallbackUrl = `${this.fallbackBase}/${encodeURIComponent(code)}/${encodeURIComponent(normalizedType)}`;
+    const fallbackUrl = `${this.fallbackBase}/${encodeURIComponent(code)}?type=${encodeURIComponent(normalizedType)}`;
 
     if (normalizedType !== 'qr' && normalizedType !== 'nfc') {
       return { url: fallbackUrl };
