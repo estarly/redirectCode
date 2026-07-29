@@ -1,18 +1,27 @@
 import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { createPool, Pool, RowDataPacket } from 'mysql2/promise';
 
-type TagCodeRow = RowDataPacket & {
+export type TagResolveRow = RowDataPacket & {
+  id: number;
   code: string;
+  user_id: number | null;
   status_qr: number;
   status_nfc: number;
   link_qr: string | null;
   link_nfc: string | null;
+  profile_status: number | null;
+  profile_slug: string | null;
+  profile_custom_domain: string | null;
 };
+
+export type ScanPlatform = 'ios' | 'android' | 'other';
 
 @Injectable()
 export class TagsCodeService implements OnModuleDestroy {
   private readonly pool: Pool;
   private readonly tableName = process.env.TAGS_TABLE_NAME ?? 'Tags_code';
+  private readonly profileTable = process.env.PROFILE_TABLE_NAME ?? 'Profile';
+  private readonly scanTable = process.env.SCAN_EVENTS_TABLE_NAME ?? 'Scan_events';
 
   constructor() {
     const databaseUrl = process.env.DATABASE_URL;
@@ -23,10 +32,65 @@ export class TagsCodeService implements OnModuleDestroy {
     this.pool = createPool(databaseUrl);
   }
 
-  async findByCode(code: string): Promise<TagCodeRow | null> {
-    const query = `SELECT code, status_qr, status_nfc, link_qr, link_nfc FROM \`${this.tableName}\` WHERE code = ? LIMIT 1`;
-    const [rows] = await this.pool.query<TagCodeRow[]>(query, [code]);
+  async findByCodeWithProfile(code: string): Promise<TagResolveRow | null> {
+    const query = `
+      SELECT
+        t.id,
+        t.code,
+        t.user_id,
+        t.status_qr,
+        t.status_nfc,
+        t.link_qr,
+        t.link_nfc,
+        p.status AS profile_status,
+        p.slug AS profile_slug,
+        p.custom_domain AS profile_custom_domain
+      FROM \`${this.tableName}\` t
+      LEFT JOIN \`${this.profileTable}\` p ON p.user_id = t.user_id
+      WHERE t.code = ?
+      LIMIT 1
+    `;
+    const [rows] = await this.pool.query<TagResolveRow[]>(query, [code]);
     return rows[0] ?? null;
+  }
+
+  /**
+   * Registra escaneo QR/NFC (conteo). No debe fallar el redirect si la tabla aún no existe.
+   */
+  async recordScanEvent(params: {
+    code: string;
+    type: 'qr' | 'nfc';
+    result: string;
+    ownerUserId?: number | null;
+    tagId?: number | null;
+    platform?: ScanPlatform;
+  }): Promise<void> {
+    try {
+      await this.pool.query(
+        `INSERT INTO \`${this.scanTable}\`
+          (\`code\`, \`type\`, \`platform\`, \`owner_user_id\`, \`tag_id\`, \`result\`, \`created_at\`)
+         VALUES (?, ?, ?, ?, ?, ?, NOW(3))`,
+        [
+          params.code,
+          params.type,
+          params.platform ?? 'other',
+          params.ownerUserId ?? null,
+          params.tagId ?? null,
+          params.result,
+        ],
+      );
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[redirectCode] No se pudo guardar Scan_events:', (err as Error)?.message);
+    }
+  }
+
+  static platformFromUa(uaRaw: string | undefined): ScanPlatform {
+    const ua = String(uaRaw ?? '').toLowerCase();
+    if (!ua) return 'other';
+    if (/iphone|ipad|ipod|ios/.test(ua)) return 'ios';
+    if (/android/.test(ua)) return 'android';
+    return 'other';
   }
 
   async onModuleDestroy() {
