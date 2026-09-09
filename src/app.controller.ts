@@ -1,5 +1,16 @@
-import { Controller, Get, Headers, Param, Redirect } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Headers,
+  Param,
+  Redirect,
+  Req,
+  HttpException,
+  HttpStatus,
+} from '@nestjs/common';
+import type { Request } from 'express';
 import { TagsCodeService } from './tags-code.service';
+import { GatewaySecurityService } from './gateway-security.service';
 
 type SupportedType = 'qr' | 'nfc';
 
@@ -29,15 +40,82 @@ export class AppController {
     process.env.PROFILE_PUBLIC_BASE_URL ?? this.appBase
   ).replace(/\/+$/, '');
 
-  constructor(private readonly tagsCodeService: TagsCodeService) {}
+  constructor(
+    private readonly tagsCodeService: TagsCodeService,
+    private readonly security: GatewaySecurityService,
+  ) {}
+
+  private isLoopbackHost(host: string): boolean {
+    const h = host.replace(/^\[|\]$/g, '').toLowerCase();
+    return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  }
+
+  private clientIp(req: Request): string {
+    const xf = String(req.headers['x-forwarded-for'] || '')
+      .split(',')[0]
+      ?.trim();
+    if (xf) return xf.slice(0, 64);
+    const realIp = String(req.headers['x-real-ip'] || '').trim();
+    if (realIp) return realIp.slice(0, 64);
+    return String(req.ip || req.socket?.remoteAddress || 'unknown').slice(0, 64);
+  }
+
+  /**
+   * Tags_code.link_qr se guarda con PROFILE_PUBLIC_BASE_URL al activar el perfil.
+   * Si eso quedó en localhost y ahora hay un host público (túnel/LAN), el 302
+   * no debe mandar el teléfono a 127.0.0.1.
+   */
+  private rewriteLoopbackTo(url: string, publicBase: string): string {
+    try {
+      const u = new URL(url);
+      const b = new URL(publicBase);
+      if (this.isLoopbackHost(u.hostname) && !this.isLoopbackHost(b.hostname)) {
+        u.protocol = b.protocol;
+        u.host = b.host;
+        return u.toString();
+      }
+    } catch {
+      /* URL inválida: se deja tal cual */
+    }
+    return url;
+  }
 
   @Get()
   index() {
     return {
       name: 'tags-redirect-api',
-      version: '1.2.0',
+      version: '1.3.0',
       route: 'GET /redirect/:type/:code',
+      health: 'GET /health',
+      ready: 'GET /ready',
     };
+  }
+
+  @Get('health')
+  health() {
+    return {
+      ok: true,
+      service: 'redirectCode',
+      ts: new Date().toISOString(),
+    };
+  }
+
+  @Get('ready')
+  async ready() {
+    const db = await this.security.pingDatabase();
+    if (!db) {
+      void this.security.recordEvent({
+        kind: 'health',
+        status: 'danger',
+        message: 'GET /ready: MySQL no responde',
+        data: { check: 'ready' },
+      });
+      throw new HttpException(
+        { ok: false, db: false, message: 'database unavailable' },
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+    return { ok: true, db: true, limits: this.security.getLimits() };
   }
 
   /** Ruta canónica del QR/NFC físico: qr.dominio.com/redirect/qr|nfc/CODE */
@@ -46,10 +124,11 @@ export class AppController {
   async redirectCanonical(
     @Param('type') type: string,
     @Param('code') code: string,
-    @Headers('user-agent') userAgent?: string,
+    @Headers('user-agent') userAgent: string | undefined,
+    @Req() req: Request,
   ) {
     return {
-      url: await this.resolveDestination(code, type, userAgent),
+      url: await this.resolveDestination(code, type, userAgent, this.clientIp(req)),
       statusCode: 302,
     };
   }
@@ -60,10 +139,16 @@ export class AppController {
   async redirectLegacy(
     @Param('code') code: string,
     @Param('type') type: string,
-    @Headers('user-agent') userAgent?: string,
+    @Headers('user-agent') userAgent: string | undefined,
+    @Req() req: Request,
   ) {
+    // Evitar capturar /health y /ready por esta ruta paramétrica
+    const c = String(code || '').toLowerCase();
+    if (c === 'health' || c === 'ready') {
+      return { url: `${this.appBase}/e/not-found`, statusCode: 302 };
+    }
     return {
-      url: await this.resolveDestination(code, type, userAgent),
+      url: await this.resolveDestination(code, type, userAgent, this.clientIp(req)),
       statusCode: 302,
     };
   }
@@ -95,22 +180,51 @@ export class AppController {
       return `https://${custom}`;
     }
     const link = String(tag.link_qr ?? '').trim();
-    if (link) return link;
+    if (link) return this.rewriteLoopbackTo(link, this.profilePublicBase);
     const slug = String(tag.profile_slug ?? '').trim().replace(/^\/+/, '');
     if (!slug) return null;
     return `${this.profilePublicBase}/p/${encodeURIComponent(slug)}`;
   }
 
+  private guardDestination(
+    url: string,
+    meta: { ip: string; userAgent?: string; code?: string; type?: string },
+  ): string {
+    const check = this.security.isDestinationAllowed(url);
+    if (check.ok) return url;
+    void this.security.recordAllowlistBlock({
+      ip: meta.ip,
+      userAgent: meta.userAgent,
+      code: meta.code,
+      type: meta.type,
+      destination: url,
+      host: check.host,
+      reason: check.reason,
+    });
+    return this.errorUrl('unavailable');
+  }
+
   private async resolveDestination(
     codeRaw: string,
     typeRaw: string,
-    userAgent?: string,
+    userAgent: string | undefined,
+    ip: string,
   ): Promise<string> {
     const code = String(codeRaw ?? '').trim();
     const normalizedType = String(typeRaw ?? '')
       .trim()
       .toLowerCase() as SupportedType;
     const platform = TagsCodeService.platformFromUa(userAgent);
+
+    const rate = this.security.checkRateLimit({
+      ip,
+      code,
+      type: normalizedType,
+      userAgent,
+    });
+    if (!rate.allowed) {
+      return this.errorUrl('unavailable');
+    }
 
     const record = (
       result: string,
@@ -142,15 +256,19 @@ export class AppController {
       return this.errorUrl('not-found');
     }
 
+    const meta = { ip, userAgent, code, type: normalizedType };
+
     if (normalizedType === 'nfc') {
       const url = this.resolveNfc(tag);
-      record(this.resultFromUrl(url, tag), tag);
-      return url;
+      const safe = this.guardDestination(url, meta);
+      record(this.resultFromUrl(safe, tag), tag);
+      return safe;
     }
 
     const url = this.resolveQr(tag);
-    record(this.resultFromUrl(url, tag), tag);
-    return url;
+    const safe = this.guardDestination(url, meta);
+    record(this.resultFromUrl(safe, tag), tag);
+    return safe;
   }
 
   /** Mapea destino a result para analytics (ok solo si llega a perfil público). */
@@ -181,7 +299,7 @@ export class AppController {
 
     if (tag.status_nfc === 1) {
       const link = String(tag.link_nfc ?? '').trim();
-      if (link) return link;
+      if (link) return this.rewriteLoopbackTo(link, this.profilePublicBase);
       return this.errorUrl('unavailable');
     }
 
