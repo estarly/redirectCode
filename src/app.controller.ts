@@ -84,8 +84,8 @@ export class AppController {
   index() {
     return {
       name: 'tags-redirect-api',
-      version: '1.3.0',
-      route: 'GET /redirect/:type/:code',
+      version: '1.5.0',
+      route: 'GET /qr/:code y GET /nfc/:code',
       health: 'GET /health',
       ready: 'GET /ready',
     };
@@ -118,7 +118,28 @@ export class AppController {
     return { ok: true, db: true, limits: this.security.getLimits() };
   }
 
-  /** Ruta canónica del QR/NFC físico: qr.dominio.com/redirect/qr|nfc/CODE */
+  /** Ruta corta del QR/NFC físico: dominio/qr|nfc/CODE */
+  @Get('qr/:code')
+  @Redirect()
+  async redirectQr(
+    @Param('code') code: string,
+    @Headers('user-agent') userAgent: string | undefined,
+    @Req() req: Request,
+  ) {
+    return this.redirectTo(code, 'qr', userAgent, req);
+  }
+
+  @Get('nfc/:code')
+  @Redirect()
+  async redirectNfc(
+    @Param('code') code: string,
+    @Headers('user-agent') userAgent: string | undefined,
+    @Req() req: Request,
+  ) {
+    return this.redirectTo(code, 'nfc', userAgent, req);
+  }
+
+  /** Alias de tarjetas ya impresas: /redirect/qr|nfc/CODE */
   @Get('redirect/:type/:code')
   @Redirect()
   async redirectCanonical(
@@ -127,10 +148,7 @@ export class AppController {
     @Headers('user-agent') userAgent: string | undefined,
     @Req() req: Request,
   ) {
-    return {
-      url: await this.resolveDestination(code, type, userAgent, this.clientIp(req)),
-      statusCode: 302,
-    };
+    return this.redirectTo(code, type, userAgent, req);
   }
 
   /** Alias legacy: /CODE/qr|nfc — mantener etiquetas ya impresas */
@@ -142,15 +160,26 @@ export class AppController {
     @Headers('user-agent') userAgent: string | undefined,
     @Req() req: Request,
   ) {
-    // Evitar capturar /health y /ready por esta ruta paramétrica
     const c = String(code || '').toLowerCase();
     if (c === 'health' || c === 'ready') {
       return { url: `${this.appBase}/e/not-found`, statusCode: 302 };
     }
-    return {
-      url: await this.resolveDestination(code, type, userAgent, this.clientIp(req)),
+    if (c === 'qr' || c === 'nfc') {
+      return this.redirectTo(type, c, userAgent, req);
+    }
+    return this.redirectTo(code, type, userAgent, req);
+  }
+
+  private redirectTo(
+    code: string,
+    type: string,
+    userAgent: string | undefined,
+    req: Request,
+  ) {
+    return this.resolveDestination(code, type, userAgent, this.clientIp(req)).then((url) => ({
+      url,
       statusCode: 302,
-    };
+    }));
   }
 
   private errorUrl(key: keyof typeof ERROR_PATHS): string {
@@ -161,8 +190,8 @@ export class AppController {
     return `${this.appBase}/login/?reason=profile_incomplete`;
   }
 
-  private registerUrl(code: string, tagId: number): string {
-    const q = `code=${encodeURIComponent(code)}&type=qr&tagId=${encodeURIComponent(String(tagId))}`;
+  private registerUrl(code: string): string {
+    const q = `code=${encodeURIComponent(code)}&type=qr`;
     return `${this.appBase}/activate-profile/?${q}`;
   }
 
@@ -313,7 +342,7 @@ export class AppController {
     Awaited<ReturnType<TagsCodeService['findByCodeWithProfile']>>
   >): string {
     if (tag.status_qr === 0) {
-      return this.registerUrl(tag.code, tag.id);
+      return this.registerUrl(tag.code);
     }
 
     if (tag.status_qr === 1) {
