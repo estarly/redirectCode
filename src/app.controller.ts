@@ -218,8 +218,12 @@ export class AppController {
   private guardDestination(
     url: string,
     meta: { ip: string; userAgent?: string; code?: string; type?: string },
+    mode: 'strict' | 'nfc' = 'strict',
   ): string {
-    const check = this.security.isDestinationAllowed(url);
+    const check =
+      mode === 'nfc'
+        ? this.security.isNfcContactDestinationAllowed(url)
+        : this.security.isDestinationAllowed(url);
     if (check.ok) return url;
     void this.security.recordAllowlistBlock({
       ip: meta.ip,
@@ -289,7 +293,7 @@ export class AppController {
 
     if (normalizedType === 'nfc') {
       const url = this.resolveNfc(tag);
-      const safe = this.guardDestination(url, meta);
+      const safe = this.guardDestination(url, meta, 'nfc');
       record(this.resultFromUrl(safe, tag), tag);
       return safe;
     }

@@ -165,6 +165,51 @@ export class GatewaySecurityService implements OnModuleDestroy {
     return { ok: false, host, reason: 'host_not_allowed' };
   }
 
+  /**
+   * Destino que el dueño ancla al chip (WhatsApp, redes, vCard, web).
+   * El QR no usa esto: sigue limitado a los hosts propios.
+   */
+  isNfcContactDestinationAllowed(urlRaw: string): {
+    ok: boolean;
+    host?: string;
+    reason?: string;
+  } {
+    const strict = this.isDestinationAllowed(urlRaw);
+    if (strict.ok) return strict;
+
+    const raw = String(urlRaw || '').trim();
+    if (/^mailto:/i.test(raw)) {
+      const email = raw.replace(/^mailto:/i, '').split('?')[0]?.trim() ?? '';
+      if (email.includes('@') && !email.includes(' ')) return { ok: true, host: 'mailto' };
+      return { ok: false, reason: 'bad_mailto' };
+    }
+    if (/^tel:/i.test(raw)) {
+      const digits = raw.replace(/^tel:/i, '').replace(/[^\d+]/g, '');
+      if (digits.replace(/\D/g, '').length >= 6) return { ok: true, host: 'tel' };
+      return { ok: false, reason: 'bad_tel' };
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      return { ok: false, reason: 'invalid_url' };
+    }
+
+    if (parsed.username || parsed.password) {
+      return { ok: false, host: parsed.hostname, reason: 'credentials' };
+    }
+    if (parsed.protocol !== 'https:') {
+      return { ok: false, host: parsed.hostname, reason: 'bad_scheme' };
+    }
+
+    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (this.isBlockedRedirectHost(host)) {
+      return { ok: false, host, reason: 'private_host' };
+    }
+    return { ok: true, host };
+  }
+
   async recordAllowlistBlock(params: {
     ip: string;
     userAgent?: string;
@@ -264,6 +309,23 @@ export class GatewaySecurityService implements OnModuleDestroy {
   private isLoopback(host: string): boolean {
     const h = host.toLowerCase();
     return h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  }
+
+  /** Hosts que no deben ser destino de un 302 (loopback, LAN, IP literal). */
+  private isBlockedRedirectHost(host: string): boolean {
+    const h = host.toLowerCase().replace(/^\[|\]$/g, '');
+    if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local')) return true;
+    if (h === '::1' || h === '0.0.0.0' || h.includes(':')) return true;
+    const ipv4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!ipv4) return false;
+    const a = Number(ipv4[1]);
+    const b = Number(ipv4[2]);
+    if ([a, b, Number(ipv4[3]), Number(ipv4[4])].some((n) => n > 255)) return true;
+    if (a === 10 || a === 127 || a === 0) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    return true;
   }
 
   private async recordEventThrottled(key: string, payload: EventPayload) {
