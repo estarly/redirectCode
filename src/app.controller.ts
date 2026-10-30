@@ -3,14 +3,15 @@ import {
   Get,
   Headers,
   Param,
-  Redirect,
   Req,
+  Res,
   HttpException,
   HttpStatus,
 } from '@nestjs/common';
-import type { Request } from 'express';
+import type { Request, Response } from 'express';
 import { TagsCodeService } from './tags-code.service';
 import { GatewaySecurityService } from './gateway-security.service';
+import { presentNfcDestination } from './native-app-link';
 
 type SupportedType = 'qr' | 'nfc';
 
@@ -120,66 +121,79 @@ export class AppController {
 
   /** Ruta corta del QR/NFC físico: dominio/qr|nfc/CODE */
   @Get('qr/:code')
-  @Redirect()
-  async redirectQr(
+  redirectQr(
     @Param('code') code: string,
     @Headers('user-agent') userAgent: string | undefined,
     @Req() req: Request,
+    @Res() res: Response,
   ) {
-    return this.redirectTo(code, 'qr', userAgent, req);
+    return this.fulfill(res, code, 'qr', userAgent, req);
   }
 
   @Get('nfc/:code')
-  @Redirect()
-  async redirectNfc(
+  redirectNfc(
     @Param('code') code: string,
     @Headers('user-agent') userAgent: string | undefined,
     @Req() req: Request,
+    @Res() res: Response,
   ) {
-    return this.redirectTo(code, 'nfc', userAgent, req);
+    return this.fulfill(res, code, 'nfc', userAgent, req);
   }
 
   /** Alias de tarjetas ya impresas: /redirect/qr|nfc/CODE */
   @Get('redirect/:type/:code')
-  @Redirect()
-  async redirectCanonical(
+  redirectCanonical(
     @Param('type') type: string,
     @Param('code') code: string,
     @Headers('user-agent') userAgent: string | undefined,
     @Req() req: Request,
+    @Res() res: Response,
   ) {
-    return this.redirectTo(code, type, userAgent, req);
+    return this.fulfill(res, code, type, userAgent, req);
   }
 
   /** Alias legacy: /CODE/qr|nfc — mantener etiquetas ya impresas */
   @Get(':code/:type')
-  @Redirect()
-  async redirectLegacy(
+  redirectLegacy(
     @Param('code') code: string,
     @Param('type') type: string,
     @Headers('user-agent') userAgent: string | undefined,
     @Req() req: Request,
+    @Res() res: Response,
   ) {
     const c = String(code || '').toLowerCase();
     if (c === 'health' || c === 'ready') {
-      return { url: `${this.appBase}/e/not-found`, statusCode: 302 };
+      res.redirect(302, `${this.appBase}/e/not-found`);
+      return;
     }
     if (c === 'qr' || c === 'nfc') {
-      return this.redirectTo(type, c, userAgent, req);
+      return this.fulfill(res, type, c, userAgent, req);
     }
-    return this.redirectTo(code, type, userAgent, req);
+    return this.fulfill(res, code, type, userAgent, req);
   }
 
-  private redirectTo(
+  /**
+   * QR: 302 al perfil. NFC de una red: en Android abre la app con intent;
+   * en iPhone una página mínima lanza la app y, si no está, vuelve a la web.
+   */
+  private async fulfill(
+    res: Response,
     code: string,
     type: string,
     userAgent: string | undefined,
     req: Request,
   ) {
-    return this.resolveDestination(code, type, userAgent, this.clientIp(req)).then((url) => ({
-      url,
-      statusCode: 302,
-    }));
+    const url = await this.resolveDestination(code, type, userAgent, this.clientIp(req));
+    if (String(type).toLowerCase() !== 'nfc') {
+      res.redirect(302, url);
+      return;
+    }
+    const presented = presentNfcDestination(url, userAgent);
+    if (presented.kind === 'html') {
+      res.status(200).setHeader('Cache-Control', 'no-store').type('html').send(presented.html);
+      return;
+    }
+    res.redirect(302, presented.url);
   }
 
   private errorUrl(key: keyof typeof ERROR_PATHS): string {
